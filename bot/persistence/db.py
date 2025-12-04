@@ -7,7 +7,7 @@ from typing import Any, Iterable
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from contextlib import asynccontextmanager
 from .engine import async_session_maker
 from .models import (
     Asset,
@@ -67,8 +67,13 @@ class DB:
     # ---------------------------------------------------------------
     # Session primitive
     # ---------------------------------------------------------------
-    async def get_session(self) -> AsyncSession:
-        return async_session_maker()
+    @asynccontextmanager
+    async def get_session(self):
+        session = async_session_maker()
+        try:
+            yield session
+        finally:
+            await session.close()
 
     # ---------------------------------------------------------------
     # Asset helpers
@@ -339,7 +344,6 @@ class DB:
             await session.refresh(trade)
             return trade
 
-
     async def record_snapshot(
         self,
         portfolio_id: int,
@@ -406,7 +410,6 @@ class DB:
 
             await session.refresh(err)
             return err
-
 
     # ---------------------------------------------------------------
     # Bulk operations: candles
