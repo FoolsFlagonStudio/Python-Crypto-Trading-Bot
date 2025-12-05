@@ -17,7 +17,7 @@ from bot.strategies.advanced.mean_reversion import MeanReversionStrategy
 from bot.strategies.advanced.trend_following import TrendFollowingStrategy
 
 # Scenario generators (you created scripts/simulated_markets.py earlier)
-from scripts.simulated_markets import SCENARIOS
+from scripts.tests.simulated_markets import SCENARIOS
 
 # ---------------------------------------------------------------------
 # Strategy registry

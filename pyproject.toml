@@ -6,7 +6,7 @@ authors = [
     {name = "Fools Flagon"}
 ]
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10,<4.0"
 
 # Runtime dependencies
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
     "python-dateutil",
     "pyyaml",
     "psycopg[binary] (>=3.2.12,<4.0.0)",
+    "coinbase-advanced-py (>=1.8.2,<2.0.0)",
 ]
 
 # Poetry-specific configuration
