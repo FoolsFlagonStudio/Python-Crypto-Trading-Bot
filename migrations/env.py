@@ -8,15 +8,22 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
-
+from dotenv import load_dotenv
+import pathlib
 # Add project root to PYTHONPATH
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # Import Base and all models
 from bot.persistence.models import Base  # noqa: F401
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+ENV_PATH = ROOT / ".env"
 
+print("Loading .env from:", ENV_PATH)  # DEBUG
+
+load_dotenv(dotenv_path=ENV_PATH)
 # Read database URL from environment
 DATABASE_URL = os.getenv("DATABASE_URL")
+print("ALEMBIC ENV DATABASE_URL =", DATABASE_URL)
 
 # Alembic Config object
 config = context.config

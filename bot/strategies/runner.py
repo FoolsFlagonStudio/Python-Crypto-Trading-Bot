@@ -36,7 +36,9 @@ class StrategyRunner:
         signals = []
 
         for candle in candles:
-
+            if self.order_manager:
+                await self.order_manager.update_trade_tracking_each_candle(candle)
+                await self.order_manager.check_auto_exits(candle)
             # load latest portfolio snapshot / open orders / open trades
             portfolio_state = await self.db.load_portfolio_state(self.portfolio_id)
 

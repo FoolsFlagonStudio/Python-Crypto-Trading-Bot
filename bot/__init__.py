@@ -1,0 +1,2 @@
+from bot.core.event_loop_fix import apply_windows_event_loop_fix
+apply_windows_event_loop_fix()

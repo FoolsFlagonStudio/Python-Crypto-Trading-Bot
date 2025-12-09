@@ -6,8 +6,8 @@ from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+
 from .engine import async_session_maker
 from .models import (
     Asset,
@@ -21,7 +21,6 @@ from .models import (
     ErrorLog,
 )
 
-
 # -------------------------------------------------------------------
 # Helper types / constants
 # -------------------------------------------------------------------
@@ -32,10 +31,11 @@ OPEN_ORDER_STATUSES = ("open", "pending", "partially_filled")
 @dataclass
 class PortfolioState:
     """Lightweight aggregate of a portfolio's state for strategy/risk modules."""
-    portfolio: Portfolio
+    portfolio: Portfolio | None
     open_orders: list[Order]
     open_trades: list[Trade]
     last_snapshot: DailySnapshot | None
+
 
 # -------------------------------------------------------------------
 # DB Facade
@@ -91,7 +91,7 @@ class DB:
                 await session.commit()
                 await session.refresh(asset)
                 return asset
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -127,7 +127,7 @@ class DB:
                 await session.commit()
                 await session.refresh(asset)
                 return asset
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -154,7 +154,7 @@ class DB:
                 await session.commit()
                 await session.refresh(portfolio)
                 return portfolio
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -182,15 +182,22 @@ class DB:
     async def load_portfolio_state(
         self,
         portfolio_id: int,
-    ) -> PortfolioState | None:
+    ) -> PortfolioState:
 
         async with async_session_maker() as session:
             pf_result = await session.execute(
                 select(Portfolio).where(Portfolio.id == portfolio_id)
             )
             portfolio = pf_result.scalars().first()
+
+            # If no portfolio exists, return an "empty" state instead of None
             if portfolio is None:
-                return None
+                return PortfolioState(
+                    portfolio=None,
+                    open_orders=[],
+                    open_trades=[],
+                    last_snapshot=None,
+                )
 
             orders_result = await session.execute(
                 select(Order).where(
@@ -291,7 +298,7 @@ class DB:
             try:
                 session.add(signal)
                 await session.commit()
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -337,7 +344,7 @@ class DB:
             try:
                 session.add(trade)
                 await session.commit()
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -380,7 +387,7 @@ class DB:
                 await session.commit()
                 await session.refresh(snapshot)
                 return snapshot
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 
@@ -404,7 +411,7 @@ class DB:
             try:
                 session.add(err)
                 await session.commit()
-            except:
+            except:  # noqa: E722
                 await session.rollback()
                 raise
 

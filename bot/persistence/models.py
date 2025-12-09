@@ -105,15 +105,20 @@ class StrategyConfig(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
     params_json: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
-    active_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    active_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    active_from: Mapped[Optional[datetime]
+                        ] = mapped_column(DateTime(timezone=True))
+    active_to: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
-    orders: Mapped[List["Order"]] = relationship(back_populates="strategy_config")
-    trades: Mapped[List["Trade"]] = relationship(back_populates="strategy_config")
-    signals: Mapped[List["Signal"]] = relationship(back_populates="strategy_config")
+    orders: Mapped[List["Order"]] = relationship(
+        back_populates="strategy_config")
+    trades: Mapped[List["Trade"]] = relationship(
+        back_populates="strategy_config")
+    signals: Mapped[List["Signal"]] = relationship(
+        back_populates="strategy_config")
     backtest_runs: Mapped[List["BacktestRun"]] = relationship(
         back_populates="strategy_config"
     )
@@ -127,14 +132,17 @@ class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolios.id"), nullable=False)
-    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    portfolio_id: Mapped[int] = mapped_column(
+        ForeignKey("portfolios.id"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(
+        ForeignKey("assets.id"), nullable=False)
     strategy_config_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("strategy_configs.id")
     )
 
     side: Mapped[str] = mapped_column(String, nullable=False)  # buy | sell
-    order_type: Mapped[Optional[str]] = mapped_column(String)   # market | limit | stop
+    order_type: Mapped[Optional[str]] = mapped_column(
+        String)   # market | limit | stop
 
     size: Mapped[float] = mapped_column(Numeric(28, 10), nullable=False)
     price: Mapped[Optional[float]] = mapped_column(Numeric(18, 8))
@@ -144,9 +152,12 @@ class Order(Base):
     is_simulated: Mapped[bool] = mapped_column(Boolean, default=False)
     fee: Mapped[float] = mapped_column(Numeric(18, 8), default=0)
 
-    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    filled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    canceled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    filled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True))
+    canceled_at: Mapped[Optional[datetime]
+                        ] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -185,8 +196,10 @@ class Trade(Base):
         ForeignKey("strategy_configs.id")
     )
 
-    entry_order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
-    exit_order_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"))
+    entry_order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id"), nullable=False)
+    exit_order_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("orders.id"))
 
     entry_price: Mapped[Optional[float]] = mapped_column(Numeric(18, 8))
     exit_price: Mapped[Optional[float]] = mapped_column(Numeric(18, 8))
@@ -195,10 +208,14 @@ class Trade(Base):
     realized_pnl: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
     realized_pnl_pct: Mapped[Optional[float]] = mapped_column(Numeric(9, 4))
 
-    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    opened_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True))
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True))
 
     exit_reason: Mapped[Optional[str]] = mapped_column(String)
+    analytics: Mapped[Optional[Dict[str, Any]]
+                     ] = mapped_column(JSON, default={})
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -236,14 +253,17 @@ class DailySnapshot(Base):
     ending_equity: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
     realized_pnl: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
     unrealized_pnl: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
-    deposits_withdrawals: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
+    deposits_withdrawals: Mapped[Optional[float]
+                                 ] = mapped_column(Numeric(18, 4))
 
     num_trades: Mapped[Optional[int]] = mapped_column(Integer)
     num_winning_trades: Mapped[Optional[int]] = mapped_column(Integer)
     num_losing_trades: Mapped[Optional[int]] = mapped_column(Integer)
 
-    max_intraday_drawdown: Mapped[Optional[float]] = mapped_column(Numeric(18, 4))
-    day_label: Mapped[Optional[str]] = mapped_column(String)  # green | red | flat
+    max_intraday_drawdown: Mapped[Optional[float]
+                                  ] = mapped_column(Numeric(18, 4))
+    day_label: Mapped[Optional[str]] = mapped_column(
+        String)  # green | red | flat
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -266,7 +286,8 @@ class Benchmark(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
-    weights_json: Mapped[Dict[str, float]] = mapped_column(JSON, nullable=False)
+    weights_json: Mapped[Dict[str, float]
+                         ] = mapped_column(JSON, nullable=False)
     base_currency: Mapped[str] = mapped_column(String, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -325,7 +346,8 @@ class BacktestRun(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    portfolio: Mapped["Portfolio"] = relationship(back_populates="backtest_runs")
+    portfolio: Mapped["Portfolio"] = relationship(
+        back_populates="backtest_runs")
     strategy_config: Mapped["StrategyConfig"] = relationship(
         back_populates="backtest_runs"
     )
@@ -375,8 +397,10 @@ class Signal(Base):
         ForeignKey("strategy_configs.id")
     )
 
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    signal_type: Mapped[str] = mapped_column(String, nullable=False)  # enter | exit | hold
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    signal_type: Mapped[str] = mapped_column(
+        String, nullable=False)  # enter | exit | hold
     price: Mapped[Optional[float]] = mapped_column(Numeric(18, 8))
     extra: Mapped[Optional[Dict[str, Any]]] = mapped_column(
         "metadata",  # column name
@@ -407,7 +431,8 @@ class RiskEvent(Base):
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
 
-    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -427,7 +452,8 @@ class ErrorLog(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     stacktrace: Mapped[Optional[str]] = mapped_column(Text)
 
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
