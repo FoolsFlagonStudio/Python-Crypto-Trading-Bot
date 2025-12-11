@@ -28,8 +28,8 @@ class MeanReversionStrategy(Strategy):
 
         # Core parameters
         self.lookback = int(self.params.get("lookback", 20))
-        self.z_entry = float(self.params.get("z_entry", -2.0))
-        self.z_exit = float(self.params.get("z_exit", -0.5))
+        self.z_entry = float(self.params.get("z_entry", -0.8))
+        self.z_exit = float(self.params.get("z_exit", -0.0))
 
         # Trade protection parameters (percentages)
         self.stop_loss_pct = float(self.params.get("stop_loss_pct", 2.0))

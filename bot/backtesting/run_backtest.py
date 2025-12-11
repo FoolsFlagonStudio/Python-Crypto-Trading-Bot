@@ -40,19 +40,18 @@ async def main():
     # 3) Create a StrategyConfig row
     # ---------------------------------------------------------
     strategy_params = {
-        "lookback": 20,
-        "threshold_pct": 0.01,   # 1% deviation
-        "use_volatility": False,
-        "vol_window": 20,
-        "vol_mult": 1.0,
+        "lookback": 12,
+        "z_entry": -1.4,
+        "z_exit": -0.25,
 
-        # execution / risk params used elsewhere:
+        # reduce losses, allow better partial exits
+        "stop_loss_pct": 0.3,
+        "take_profit_pct": 0.8,
+
         "max_slippage_pct": 0.25,
-        "stop_loss_pct": 2.0,
-        "take_profit_pct": 4.0,
         "max_risk_pct": 0.02,
         "max_daily_loss_pct": 0.03,
-        "max_trades_per_day": 6,
+        "max_trades_per_day": 15,
     }
 
     async with db.get_session() as session:
