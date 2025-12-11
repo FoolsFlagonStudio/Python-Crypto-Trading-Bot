@@ -418,6 +418,36 @@ class DB:
             await session.refresh(err)
             return err
 
+    async def record_risk_event(
+        self,
+        portfolio_id: int,
+        event_type: str,
+        details: dict[str, Any] | None = None,
+        triggered_at: datetime | None = None,
+    ) -> RiskEvent:
+        """
+        Persist a RiskEvent row. Used by the RiskManager when any
+        risk rule triggers (veto or soft warning-worthy conditions).
+        """
+        triggered_at = self._normalize_dt(triggered_at)
+
+        async with async_session_maker() as session:
+            evt = RiskEvent(
+                portfolio_id=portfolio_id,
+                event_type=event_type,
+                details=details,
+                triggered_at=triggered_at,
+            )
+            try:
+                session.add(evt)
+                await session.commit()
+            except:  # noqa: E722
+                await session.rollback()
+                raise
+
+            await session.refresh(evt)
+            return evt
+
     # ---------------------------------------------------------------
     # Bulk operations: candles
     # ---------------------------------------------------------------

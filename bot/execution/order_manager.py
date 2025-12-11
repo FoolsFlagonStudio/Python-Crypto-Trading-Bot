@@ -2,22 +2,33 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
-from bot.execution.base import ExecutionEngine, ExecutionResult
-from bot.persistence.models import Order
 from bot.core.logger import get_logger
-from bot.persistence.models import Order, Trade, Asset
+from bot.execution.base import ExecutionEngine, ExecutionResult
 from bot.execution.simulated import SimulatedExecutionEngine
-
+from bot.persistence.db import DB, PortfolioState
+from bot.persistence.models import Order, Trade, Asset
+from bot.risk.manager import RiskManager
 
 logger = get_logger(__name__)
 
 
 class OrderManager:
+    """
+    Bridges signals ↔ execution engine ↔ database.
+
+    - Applies slippage constraints and marketable-limit logic.
+    - Calls the ExecutionEngine (simulated or live).
+    - Writes Orders + Trades + analytics to the DB.
+    - Uses RiskManager (exposed as .risk_manager) but does not
+      own high-level risk policy (StrategyRunner orchestrates that).
+    """
+
     def __init__(
         self,
-        db,
-        execution_engine,
+        db: DB,
+        execution_engine: ExecutionEngine,
         portfolio_id: int,
         asset_id: int,
         strategy_config_id: int,
@@ -31,61 +42,116 @@ class OrderManager:
         self.strategy_params = strategy_params
 
         # Derive mode from engine type
-        self.mode = "paper" if isinstance(execution_engine, SimulatedExecutionEngine) else "live"
+        self.mode = (
+            "paper" if isinstance(
+                execution_engine, SimulatedExecutionEngine) else "live"
+        )
 
-    def _compute_slippage_and_limit(self, signal_price: float, preview_price: float) -> tuple[float, float, bool]:
+        # Attach risk manager (primary checks still in StrategyRunner)
+        self.risk_manager = RiskManager(
+            db=db,
+            portfolio_id=portfolio_id,
+            asset_id=asset_id,
+            strategy_params=strategy_params,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _compute_slippage_and_limit(
+        self,
+        signal_price: float,
+        preview_price: float,
+    ) -> tuple[float, float, bool]:
         """
         Returns (price_change_pct, limit_price, is_acceptable)
         """
+        max_slip_pct = float(self.strategy_params.get("max_slippage_pct", 0.0))
 
-        max_slip_pct = float(self.strategy_params.get("max_slippage_pct", 0))
+        if signal_price <= 0:
+            raise ValueError(f"Invalid signal price: {signal_price}")
 
         # % difference between preview & expected (signal) price
         price_change_pct = abs(
-            preview_price - signal_price) / signal_price * 100
-
+            preview_price - signal_price) / signal_price * 100.0
         is_ok = price_change_pct <= max_slip_pct
 
         # Build marketable-limit bounds
         if preview_price >= signal_price:
             # BUY — allow up to +slippage
-            limit_price = signal_price * (1 + max_slip_pct / 100)
+            limit_price = signal_price * (1.0 + max_slip_pct / 100.0)
         else:
             # SELL — allow down to -slippage
-            limit_price = signal_price * (1 - max_slip_pct / 100)
+            limit_price = signal_price * (1.0 - max_slip_pct / 100.0)
 
         return price_change_pct, limit_price, is_ok
 
-    # ---------------------------------------------------------
-    # ENTER
-    # ---------------------------------------------------------
-
-    async def handle_enter(self, price: float, timestamp: datetime, candle=None):
-        """
-        Entry with slippage control + marketable limit orders + analytics metadata.
-        """
-
-        # Load portfolio state
-        state = await self.db.load_portfolio_state(self.portfolio_id)
-        portfolio = state.portfolio
-
-        # Get asset symbol
+    async def _get_asset(self) -> Asset:
         async with self.db.get_session() as session:
             asset = await session.get(Asset, self.asset_id)
+            if asset is None:
+                raise RuntimeError(f"Asset id={self.asset_id} not found")
+            return asset
+
+    # ------------------------------------------------------------------
+    # ENTER
+    # ------------------------------------------------------------------
+    async def handle_enter(
+        self,
+        price: float,
+        timestamp: datetime,
+        candle: Any | None = None,
+        size_override: float | None = None,
+        state: PortfolioState | None = None,
+    ):
+        """
+        Entry with slippage control + marketable limit orders + analytics metadata.
+
+        Args:
+            price:       signal price (from strategy)
+            timestamp:   when the signal occurred
+            candle:      the candle that triggered the signal (optional, for analytics)
+            size_override: if provided, use this as position size
+                           (e.g., from RiskManager); otherwise compute from equity
+            state:       current PortfolioState; if None, we'll load a fresh one
+        """
+
+        # Load state if not provided (backwards compatibility)
+        if state is None:
+            state = await self.db.load_portfolio_state(self.portfolio_id)
+
+        portfolio = state.portfolio
+        if portfolio is None:
+            raise RuntimeError(
+                f"Portfolio id={self.portfolio_id} missing while handling ENTER."
+            )
+
+        # Get asset symbol
+        asset = await self._get_asset()
 
         # ---------------------------------------------------
-        # Compute risk-based position size
+        # Compute risk-based position size (risk override wins)
         # ---------------------------------------------------
-        equity = (
-            state.last_snapshot.ending_equity
-            if state.last_snapshot
-            else portfolio.starting_equity
-        )
-        if equity is None:
-            raise ValueError("Portfolio has no starting or snapshot equity.")
+        if size_override is not None:
+            size = float(size_override)
+        else:
+            equity = (
+                state.last_snapshot.ending_equity
+                if state.last_snapshot
+                else portfolio.starting_equity
+            )
+            if equity is None:
+                raise ValueError(
+                    "Portfolio has no starting or snapshot equity.")
 
-        max_risk = Decimal(equity) * Decimal("0.02")
-        size = float(max_risk / Decimal(price))
+            # default 2% if no config
+            max_risk = Decimal(str(equity)) * Decimal("0.02")
+            size = float(max_risk / Decimal(str(price)))
+
+        if size <= 0:
+            logger.warning(
+                "[ENTER] Computed non-positive size, skipping order.")
+            return None
 
         # ---------------------------------------------------
         # PREVIEW (expected fill / quote price)
@@ -150,7 +216,7 @@ class OrderManager:
             # ---------------------------------------------------
             # Submit marketable-limit order to exchange
             # ---------------------------------------------------
-            submission = await self.engine.submit(
+            submission: ExecutionResult = await self.engine.submit(
                 symbol=asset.symbol,
                 side="BUY",
                 size=size,
@@ -165,7 +231,7 @@ class OrderManager:
         # Poll exchange until filled / canceled
         # ---------------------------------------------------
         while True:
-            result = await self.engine.poll(order.exchange_order_id)
+            result: ExecutionResult = await self.engine.poll(order.exchange_order_id)
             if result.status in ("FILLED", "CANCELLED", "REJECTED"):
                 break
 
@@ -181,15 +247,15 @@ class OrderManager:
             db_order.fee = result.fee
 
             if result.status == "FILLED":
-
                 # -------------------------------
                 # Initial Trade Metadata
                 # -------------------------------
                 volatility = None
-                if candle:
-                    volatility = float(candle.high - candle.low) / candle.close
+                if candle is not None and getattr(candle, "close", None):
+                    volatility = float(
+                        candle.high - candle.low) / float(candle.close)
 
-                initial_tags = {
+                initial_tags: dict[str, Any] = {
                     "entry_reason": "signal",
                     "volatility_at_entry": volatility,
                     "mfe": 0.0,
@@ -199,7 +265,7 @@ class OrderManager:
                     "entry_timestamp": timestamp.isoformat(),
                 }
 
-                # Create Trade row with metadata
+                # Create Trade row
                 trade = await self.db.record_trade(
                     portfolio_id=self.portfolio_id,
                     asset_id=self.asset_id,
@@ -213,9 +279,10 @@ class OrderManager:
                     realized_pnl_pct=None,
                     opened_at=db_order.filled_at,
                     closed_at=None,
+                    exit_reason=None,
                 )
 
-                # Save metadata
+                # Save analytics metadata
                 db_trade = await session.get(type(trade), trade.id)
                 db_trade.analytics = initial_tags
 
@@ -223,25 +290,38 @@ class OrderManager:
 
         return order
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     # EXIT
-    # ---------------------------------------------------------
-    async def handle_exit(self, price: float, timestamp: datetime, auto_reason: str | None = None):
+    # ------------------------------------------------------------------
+    async def handle_exit(
+        self,
+        price: float,
+        timestamp: datetime,
+        auto_reason: str | None = None,
+        state: PortfolioState | None = None,
+    ):
         """
         Exit with slippage control + marketable limit order.
+
+        Args:
+            price:       signal/trigger price
+            timestamp:   when the signal/trigger occurred
+            auto_reason: if set, mark the trade as e.g. "stop_loss" or "take_profit"
+            state:       current PortfolioState; if None, we'll load a fresh one
         """
 
-        # Load state
-        state = await self.db.load_portfolio_state(self.portfolio_id)
+        # Load state if not provided
+        if state is None:
+            state = await self.db.load_portfolio_state(self.portfolio_id)
+
         if not state.open_trades:
-            logger.warning("EXIT signal but no open trades.")
+            logger.warning("[EXIT] Signal but no open trades.")
             return None
 
         trade = state.open_trades[0]
 
-        # Get asset directly
-        async with self.db.get_session() as session:
-            asset = await session.get(Asset, self.asset_id)
+        # Get asset
+        asset = await self._get_asset()
 
         # ---------------------------------------------------
         # PREVIEW exit price
@@ -261,13 +341,9 @@ class OrderManager:
                 .get("price")
             )
         except AttributeError:
-            # preview or nested dicts weren't dict-like; ignore and fall back
             raw_price = None
 
-        if raw_price is None:
-            preview_price = float(price)
-        else:
-            preview_price = float(raw_price)
+        preview_price = float(price if raw_price is None else raw_price)
 
         # ---------------------------------------------------
         # Slippage enforcement
@@ -309,7 +385,7 @@ class OrderManager:
             await session.flush()
 
             # Submit to exchange / paper engine
-            submission = await self.engine.submit(
+            submission: ExecutionResult = await self.engine.submit(
                 symbol=asset.symbol,
                 side="SELL",
                 size=float(trade.size),
@@ -324,7 +400,7 @@ class OrderManager:
         # Poll for fill
         # ---------------------------------------------------
         while True:
-            result = await self.engine.poll(order.exchange_order_id)
+            result: ExecutionResult = await self.engine.poll(order.exchange_order_id)
             if result.status in ("FILLED", "CANCELLED", "REJECTED"):
                 break
 
@@ -340,7 +416,7 @@ class OrderManager:
             db_order.fee = result.fee
 
             if result.status == "FILLED":
-                # Normalize to Decimal
+                # Normalize Decimals
                 entry_price_dec = trade.entry_price
                 exit_price_dec = Decimal(str(result.avg_fill_price))
                 size_dec = trade.size or Decimal("0")
@@ -392,7 +468,14 @@ class OrderManager:
 
         return order
 
-    async def check_auto_exits(self, candle):
+    # ------------------------------------------------------------------
+    # AUTO-EXIT CHECKS
+    # ------------------------------------------------------------------
+    async def check_auto_exits(
+        self,
+        candle: Any,
+        state: PortfolioState | None = None,
+    ):
         """
         Called every candle (or tick) to check:
         - stop-loss hit
@@ -401,27 +484,30 @@ class OrderManager:
         If either triggers → place exit order automatically.
         """
 
-        state = await self.db.load_portfolio_state(self.portfolio_id)
+        if state is None:
+            state = await self.db.load_portfolio_state(self.portfolio_id)
+
         if not state.open_trades:
             return None  # no open positions
 
         trade = state.open_trades[0]
 
-        stop_loss_pct = float(self.strategy_params.get("stop_loss_pct", 0))
-        take_profit_pct = float(self.strategy_params.get("take_profit_pct", 0))
+        stop_loss_pct = float(self.strategy_params.get("stop_loss_pct", 0.0))
+        take_profit_pct = float(
+            self.strategy_params.get("take_profit_pct", 0.0))
 
-        if stop_loss_pct == 0 and take_profit_pct == 0:
+        if stop_loss_pct == 0.0 and take_profit_pct == 0.0:
             return None  # no auto-exit logic enabled
 
         entry_price = float(trade.entry_price)
         current_price = float(candle.close)
 
         # Calculate thresholds
-        sl_trigger = entry_price * (1 - stop_loss_pct / 100)
-        tp_trigger = entry_price * (1 + take_profit_pct / 100)
+        sl_trigger = entry_price * (1.0 - stop_loss_pct / 100.0)
+        tp_trigger = entry_price * (1.0 + take_profit_pct / 100.0)
 
         # Check SL
-        if stop_loss_pct > 0 and current_price <= sl_trigger:
+        if stop_loss_pct > 0.0 and current_price <= sl_trigger:
             logger.info(
                 f"[AUTO STOP LOSS] price={current_price} <= {sl_trigger} "
                 f"({stop_loss_pct}% below entry)"
@@ -429,11 +515,12 @@ class OrderManager:
             return await self.handle_exit(
                 price=current_price,
                 timestamp=candle.timestamp,
-                auto_reason="stop_loss"
+                auto_reason="stop_loss",
+                state=state,
             )
 
         # Check TP
-        if take_profit_pct > 0 and current_price >= tp_trigger:
+        if take_profit_pct > 0.0 and current_price >= tp_trigger:
             logger.info(
                 f"[AUTO TAKE PROFIT] price={current_price} >= {tp_trigger} "
                 f"({take_profit_pct}% above entry)"
@@ -441,19 +528,27 @@ class OrderManager:
             return await self.handle_exit(
                 price=current_price,
                 timestamp=candle.timestamp,
-                auto_reason="take_profit"
+                auto_reason="take_profit",
+                state=state,
             )
 
         return None
 
-    async def update_trade_tracking_each_candle(self, candle):
+    # ------------------------------------------------------------------
+    # PER-CANDLE ANALYTICS TRACKING
+    # ------------------------------------------------------------------
+    async def update_trade_tracking_each_candle(
+        self,
+        candle: Any,
+        state: PortfolioState | None = None,
+    ):
         """
         Called every candle to update MFE/MAE + drawdown stats on open trades.
         """
 
-        state = await self.db.load_portfolio_state(self.portfolio_id)
         if state is None:
-            return
+            state = await self.db.load_portfolio_state(self.portfolio_id)
+
         if not state.open_trades:
             return None
 
