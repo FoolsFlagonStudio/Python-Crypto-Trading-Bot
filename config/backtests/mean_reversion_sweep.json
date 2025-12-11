@@ -1,0 +1,25 @@
+{
+  "portfolio_id": 3,
+  "asset_id": 1,
+  "strategy_config_id": 1,
+  "timeframe": "1h",
+  "start": "2024-01-01T00:00:00Z",
+  "end": "2024-03-01T00:00:00Z",
+  "strategy_path": "bot.strategies.advanced.mean_reversion.MeanReversionStrategy",
+  "base_params": {
+    "use_volatility": true,
+    "vol_window": 20,
+    "vol_mult": 1.0,
+    "max_history": 200,
+    "max_risk_pct": 0.02,
+    "max_daily_loss_pct": 0.03,
+    "max_trades_per_day": 6,
+    "max_slippage_pct": 0.25,
+    "stop_loss_pct": 2.0,
+    "take_profit_pct": 4.0
+  },
+  "sweep": {
+    "lookback": [10, 20, 30],
+    "threshold_pct": [0.005, 0.01, 0.02]
+  }
+}

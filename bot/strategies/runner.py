@@ -41,6 +41,8 @@ class StrategyRunner:
         # prevent two ENTER or two EXIT in a row from the strategy
         self.last_signal_type: SignalType | None = None
 
+        self.logger = logger
+
     async def _record_risk_veto(
         self,
         veto_reason: str,
@@ -90,123 +92,66 @@ class StrategyRunner:
         except Exception:
             logger.exception("[RISK] Failed to record warning RiskEvent")
 
-    async def run(self, candles: Iterable) -> List[StrategySignal]:
+    async def run(self, candles):
         """
-        Main loop for executing a strategy over a series of candles.
-
-        Returns:
-            List[StrategySignal]  - all signals produced (enter/exit/hold)
+        Run strategy over a chronological list of candle-like objects.
+        Produces a list of StrategySignal objects and triggers the order manager.
         """
-        signals: list[StrategySignal] = []
+        signals = []
 
         for candle in candles:
-            # -------------------------------------------------
-            # Load current portfolio state ONCE per candle
-            # (open trades, open orders, last snapshot, etc.)
-            # -------------------------------------------------
-            portfolio_state: PortfolioState = await self.db.load_portfolio_state(
-                self.portfolio_id
-            )
+            timestamp = candle.timestamp
+            price = float(candle.close)
 
-            # -------------------------------------------------
-            # Per-candle trade tracking & auto exits
-            # -------------------------------------------------
-            if self.order_manager:
-                # These now accept the current state so we don't reload in each.
-                await self.order_manager.update_trade_tracking_each_candle(
-                    candle, portfolio_state
-                )
-                await self.order_manager.check_auto_exits(
-                    candle, portfolio_state
-                )
+            # Get the signal from the strategy
+            sig = self.strategy.on_bar(candle)
 
-            # -------------------------------------------------
-            # Strategy produces the next signal from this candle + state
-            # -------------------------------------------------
-            sig = self.strategy.generate_signal(candle, portfolio_state)
-
+            # Normalize missing or None signals → HOLD
             if sig is None:
                 continue
 
-            # Debounce: avoid ENTER→ENTER→ENTER or EXIT→EXIT→EXIT spam
-            if sig.signal_type == self.last_signal_type:
-                logger.debug(
-                    f"[STRATEGY] Skipping duplicate {sig.signal_type} signal")
-                continue
+            # ----------------------------
+            # Normalize signal_type safely
+            # ----------------------------
+            raw_type = sig.signal_type
 
-            self.last_signal_type = sig.signal_type
-            signals.append(sig)
+            if raw_type is None:
+                continue  # treat as HOLD / skip
 
-            logger.info(
-                f"[SIGNAL] {sig.signal_type.value.upper()} @ {sig.price}")
+            # Enum → extract value
+            if hasattr(raw_type, "value"):
+                signal_type = str(raw_type.value)
 
-            # -------------------------------------------------
-            # Persist the signal itself
-            # -------------------------------------------------
+            # Already a string
+            elif isinstance(raw_type, str):
+                signal_type = raw_type
+
+            # Numeric / weird values: treat as HOLD (or raise, your choice)
+            else:
+                self.logger.debug(f"[WARN] Invalid signal_type {raw_type}; treating as HOLD")
+                signal_type = "HOLD"
+
+            # debug logging
+            self.logger.debug(f"[SIGNAL] {signal_type.upper()} @ {sig.price}")
+
+            # Record signal into DB (async safe)
             await self.db.record_signal(
                 portfolio_id=self.portfolio_id,
                 asset_id=self.asset_id,
                 strategy_config_id=self.strategy_config_id,
-                signal_type=sig.signal_type.value,
+                signal_type=signal_type,
                 price=sig.price,
                 extra=sig.metadata,
-                timestamp=sig.timestamp,
+                timestamp=timestamp,
             )
 
-            # -------------------------------------------------
-            # EXECUTION SECTION (optional)
-            # -------------------------------------------------
-            if not self.order_manager:
-                # pure backtest mode — caller can interpret signals manually
-                continue
+            # Pass into order manager
+            await self.order_manager.handle_signal(
+                signal_type=signal_type,
+                price=sig.price,
+                timestamp=timestamp,
+            )
 
-            # -------------------------------
-            # ENTER logic + risk checks
-            # -------------------------------
-            if sig.signal_type == SignalType.ENTER:
-                # Primary risk check
-                risk = await self.order_manager.risk_manager.evaluate_entry(
-                    candle=candle,
-                    state=portfolio_state,
-                )
-
-                if risk.is_veto():
-                    logger.warning(f"[RISK VETO] {risk.veto_reason}")
-                    await self._record_risk_veto(
-                        veto_reason=risk.veto_reason or "unspecified",
-                        candle=candle,
-                        signal_price=sig.price,
-                    )
-                    continue
-
-                # Soft warnings (no veto)
-                for w in risk.warnings:
-                    logger.warning(f"[RISK WARNING] {w}")
-                    await self._record_risk_warning(
-                        warning=w,
-                        candle=candle,
-                        signal_price=sig.price,
-                    )
-
-                # Hand off to OrderManager; risk size wins
-                await self.order_manager.handle_enter(
-                    price=sig.price,
-                    timestamp=sig.timestamp,
-                    candle=candle,
-                    size_override=risk.size,
-                    state=portfolio_state,
-                )
-
-            # -------------------------------
-            # EXIT logic
-            # -------------------------------
-            elif sig.signal_type == SignalType.EXIT:
-                await self.order_manager.handle_exit(
-                    price=sig.price,
-                    timestamp=sig.timestamp,
-                    state=portfolio_state,
-                )
-
-            # HOLD does nothing
+            signals.append(sig)
 
         return signals

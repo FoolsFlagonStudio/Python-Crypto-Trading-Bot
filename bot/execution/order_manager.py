@@ -94,6 +94,48 @@ class OrderManager:
             return asset
 
     # ------------------------------------------------------------------
+    # UNIFIED SIGNAL HANDLER
+    # ------------------------------------------------------------------
+    async def handle_signal(
+        self,
+        signal_type: str,
+        price: float,
+        timestamp,
+        candle=None,
+    ):
+        """
+        Adapter so StrategyRunner can call one function.
+
+        signal_type values expected: "ENTER", "EXIT", "HOLD".
+        """
+
+        st = signal_type.upper()
+
+        # HOLD = nothing to do
+        if st == "HOLD":
+            return None
+
+        # ENTER
+        if st == "ENTER":
+            return await self.handle_enter(
+                price=price,
+                timestamp=timestamp,
+                candle=candle,
+            )
+
+        # EXIT
+        if st == "EXIT":
+            return await self.handle_exit(
+                price=price,
+                timestamp=timestamp,
+            )
+
+        # Fallback (unknown signal)
+        logger.warning(f"[OrderManager] Unknown signal_type={signal_type}")
+        return None
+
+
+    # ------------------------------------------------------------------
     # ENTER
     # ------------------------------------------------------------------
     async def handle_enter(

@@ -1,223 +1,136 @@
 # bot/strategies/advanced/mean_reversion.py
 
 from __future__ import annotations
-
 from collections import deque
-from typing import Optional
+from typing import Optional, Deque
 
 from bot.strategies.base import Strategy
-from bot.strategies.signals import StrategySignal, SignalType
-from bot.strategies.indicators.moving_averages import sma
-from bot.strategies.indicators.volatility import volatility_stddev
-from bot.strategies.portfolio_metrics import (
-    compute_unrealized_pnl,
-    compute_last_trade_info,
-    compute_drawdown_status,
-)
-from bot.core.logger import get_logger
-
-logger = get_logger(__name__)
+from bot.strategies.signals import StrategySignal
 
 
 class MeanReversionStrategy(Strategy):
     """
-    Mean Reversion Strategy (Buy Low, Sell High).
+    Classic mean reversion using z-score:
 
-    Core logic:
-      - When price falls below rolling SMA by a certain % threshold → ENTER (buy)
-      - When price reverts back toward SMA or rises above it → EXIT (sell)
+        z = (price - mean) / std
 
-    Optional enhancements supported:
-      - Volatility filter (stddev on returns)
-      - Custom lookback for SMA
-      - Custom deviation threshold
+    Entry:
+        z <= z_entry  (e.g. -2.0)
 
-    Parameters:
-      - lookback: int            # SMA window (default: 20)
-      - threshold_pct: float     # deviation threshold (default: 0.01 = 1%)
-      - use_volatility: bool     # enable volatility filter
-      - vol_window: int          # window for stddev volatility
-      - vol_mult: float          # multiplier to scale threshold based on vol
-      - max_history: int         # strategy rolling history size
+    Exit:
+        z >= z_exit   (e.g. -0.5)
+
+    Includes stop loss + take profit logic.
     """
 
-    def __init__(self, params: dict | None = None):
+    def __init__(self, params: dict):
         super().__init__(params)
 
+        # Core parameters
         self.lookback = int(self.params.get("lookback", 20))
-        self.threshold_pct = float(
-            self.params.get("threshold_pct", 0.01))  # 1%
+        self.z_entry = float(self.params.get("z_entry", -2.0))
+        self.z_exit = float(self.params.get("z_exit", -0.5))
 
-        # Volatility filter
-        self.use_volatility = bool(self.params.get("use_volatility", False))
-        self.vol_window = int(self.params.get("vol_window", 20))
-        self.vol_mult = float(self.params.get("vol_mult", 1.0))
+        # Trade protection parameters (percentages)
+        self.stop_loss_pct = float(self.params.get("stop_loss_pct", 2.0))
+        self.take_profit_pct = float(self.params.get("take_profit_pct", 4.0))
 
-        max_history = int(self.params.get("max_history", self.lookback * 4))
+        # Rolling window
+        self.prices: Deque[float] = deque(maxlen=self.lookback)
 
-        self.closes = deque(maxlen=max_history)
+        # Position state
+        self.in_position: bool = False
+        self.entry_price: Optional[float] = None
 
-        # Computed each candle
-        self.mean: Optional[float] = None
-        self.deviation: Optional[float] = None
-        self.volatility: Optional[float] = None
+    def reset(self):
+        self.prices.clear()
+        self.in_position = False
+        self.entry_price = None
 
-        if self.lookback <= 0:
-            raise ValueError("lookback must be positive")
-
-    # ----------------------------------------------------------------------
-    # Internal calculation helpers
-    # ----------------------------------------------------------------------
-
-    def _update_indicators(self) -> None:
-        """
-        Compute rolling SMA, deviation, and optional volatility.
-        """
-        if len(self.closes) < self.lookback:
-            self.mean = None
-            self.deviation = None
-            self.volatility = None
-            return
-
-        close = self.closes[-1]
-        mean = sma(self.closes, self.lookback)
-
-        if mean is None:
-            self.mean = None
-            self.deviation = None
-            self.volatility = None
-            return
-
-        self.mean = mean
-        self.deviation = (close - mean) / mean  # fractional deviation
-
-        # volatility (optional)
-        if self.use_volatility:
-            vol = volatility_stddev(self.closes, self.vol_window)
-            self.volatility = vol
-        else:
-            self.volatility = None
-
-    def _has_enough_data(self) -> bool:
-        return self.mean is not None
-
-    # ----------------------------------------------------------------------
-    # Strategy logic
-    # ----------------------------------------------------------------------
-
-    def should_enter(self, candle, portfolio_state) -> bool:
-        close = float(candle.close)
-        self.closes.append(close)
-
-        self._update_indicators()
-        if not self._has_enough_data():
-            return False
-
-        # Base threshold
-        threshold = self.threshold_pct
-
-        # Expand threshold based on volatility, if enabled
-        if self.use_volatility and self.volatility is not None:
-            threshold = max(threshold, self.volatility * self.vol_mult)
-
-        # Enter when price is significantly BELOW the mean
-        if self.deviation < -threshold:
-            logger.info(
-                "[MEAN_REVERT] ENTER: deviation %.4f < threshold %.4f (close=%.2f mean=%.2f)",
-                self.deviation,
-                threshold,
-                close,
-                self.mean,
-            )
-            return True
-
-        return False
-
-    def should_exit(self, candle, portfolio_state) -> bool:
-        close = float(candle.close)
-
-        # If no price history yet, append and skip exit
-        if len(self.closes) == 0:
-            self.closes.append(close)
-            return False
-
-        self.closes.append(close)
-        self._update_indicators()
-
-        if not self._has_enough_data():
-            return False
-
-        threshold = self.threshold_pct
-        if self.use_volatility and self.volatility is not None:
-            threshold = max(threshold, self.volatility * self.vol_mult)
-
-        # Exit when price returns near mean or rises above it
-        if self.deviation >= -threshold * 0.25:  # near or above mean
-            logger.info(
-                "[MEAN_REVERT] EXIT: deviation %.4f >= reversion_level (close=%.2f mean=%.2f)",
-                self.deviation,
-                close,
-                self.mean,
-            )
-            return True
-
-        return False
-
-    # ----------------------------------------------------------------------
-    # Metadata: Unrealized P/L, Volatility, Last Trade, Drawdown
-    # ----------------------------------------------------------------------
-
-    def generate_signal(self, candle, portfolio_state) -> StrategySignal:
-        sig = super().generate_signal(candle, portfolio_state)
-
-        if sig.metadata is None:
-            sig.metadata = {}
-
+    # ---------------------------------------------------------
+    # Main strategy callback — called on each candle
+    # ---------------------------------------------------------
+    def on_bar(self, candle):
         price = float(candle.close)
+        ts = candle.timestamp
 
-        # --- Portfolio / risk metrics ---
-        unrealized = compute_unrealized_pnl(portfolio_state, price)
-        last_entry_price, last_opened_at, seconds_since_last = compute_last_trade_info(
-            portfolio_state
+        # Update buffer
+        self.prices.append(price)
+
+        # Not enough data for mean/std → no signal
+        if len(self.prices) < self.lookback:
+            return None
+
+        mean = sum(self.prices) / len(self.prices)
+        variance = sum((p - mean) ** 2 for p in self.prices) / len(self.prices)
+        std = variance ** 0.5 if variance > 0 else 1e-8
+
+        z = (price - mean) / std
+
+        # Common metadata for debugging & DB logging
+        metadata = {
+            "price": price,
+            "mean": mean,
+            "std": std,
+            "z": z,
+            "in_position": self.in_position,
+        }
+
+        # -----------------------------------------------------
+        # ENTRY LOGIC
+        # -----------------------------------------------------
+        if not self.in_position and z <= self.z_entry:
+            self.in_position = True
+            self.entry_price = price
+
+            return StrategySignal(
+                signal_type="ENTER",
+                price=price,
+                timestamp=ts,
+                metadata=metadata,
+            )
+
+        # -----------------------------------------------------
+        # EXIT LOGIC
+        # -----------------------------------------------------
+        if self.in_position:
+
+            # Stop-loss
+            if self.entry_price and price <= self.entry_price * (1 - self.stop_loss_pct / 100):
+                self.in_position = False
+                return StrategySignal(
+                    signal_type="EXIT",
+                    price=price,
+                    timestamp=ts,
+                    metadata=metadata | {"reason": "stop_loss"},
+                )
+
+            # Take-profit
+            if self.entry_price and price >= self.entry_price * (1 + self.take_profit_pct / 100):
+                self.in_position = False
+                return StrategySignal(
+                    signal_type="EXIT",
+                    price=price,
+                    timestamp=ts,
+                    metadata=metadata | {"reason": "take_profit"},
+                )
+
+            # Normal exit based on z-score
+            if z >= self.z_exit:
+                self.in_position = False
+                return StrategySignal(
+                    signal_type="EXIT",
+                    price=price,
+                    timestamp=ts,
+                    metadata=metadata,
+                )
+
+        # -----------------------------------------------------
+        # HOLD — no trade action
+        # -----------------------------------------------------
+        return StrategySignal(
+            signal_type="HOLD",
+            price=price,      # float only
+            timestamp=ts,
+            metadata=metadata,
         )
-        dd_status = compute_drawdown_status(
-            portfolio_state,
-            unrealized_pnl=unrealized,
-        )
-
-        # --- Rolling indicator exports (mean reversion context) ---
-        sig.metadata.update(
-            {
-                "strategy": "mean_reversion",
-                "lookback": self.lookback,
-                "threshold_pct": self.threshold_pct,
-                "mean": self.mean,
-                "deviation": self.deviation,
-                "volatility_enabled": self.use_volatility,
-                "volatility": self.volatility,
-                "vol_window": self.vol_window,
-                "vol_mult": self.vol_mult,
-                # Portfolio / P&L metrics
-                "unrealized_pnl": unrealized,
-                "last_entry_price": last_entry_price,
-                "last_trade_opened_at": last_opened_at.isoformat()
-                if last_opened_at
-                else None,
-                "time_since_last_trade_seconds": seconds_since_last,
-                # Drawdown snapshot
-                "current_equity_est": dd_status["current_equity"],
-                "estimated_peak_equity": dd_status["estimated_peak_equity"],
-                "drawdown_abs": dd_status["drawdown_abs"],
-                "drawdown_pct": dd_status["drawdown_pct"],
-                "max_intraday_drawdown": dd_status["max_intraday_drawdown"],
-            }
-        )
-
-        if sig.signal_type == SignalType.ENTER:
-            sig.metadata["reason"] = "price_below_mean_threshold"
-        elif sig.signal_type == SignalType.EXIT:
-            sig.metadata["reason"] = "mean_reversion_exit"
-        else:
-            sig.metadata.setdefault("reason", "mean_reversion_hold")
-
-        return sig
