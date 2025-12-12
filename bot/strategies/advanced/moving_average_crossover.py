@@ -1,87 +1,90 @@
 # bot/strategies/advanced/moving_average_crossover.py
 
 from __future__ import annotations
-
 from collections import deque
-from typing import Optional
+from typing import Optional, Deque
 
 from bot.strategies.base import Strategy
-from bot.strategies.signals import StrategySignal, SignalType
-from bot.strategies.indicators.moving_averages import ema
-from bot.strategies.portfolio_metrics import (
-    compute_unrealized_pnl,
-    compute_last_trade_info,
-    compute_drawdown_status,
-)
+from bot.strategies.signals import StrategySignal
 from bot.core.logger import get_logger
 
 logger = get_logger(__name__)
 
 
+def ema(prev: Optional[float], price: float, period: int) -> float:
+    """Simple streaming EMA update."""
+    if prev is None:
+        return price
+    k = 2.0 / (period + 1)
+    return price * k + prev * (1 - k)
+
+
 class MovingAverageCrossoverStrategy(Strategy):
     """
-    Classic moving average crossover strategy with expanded analytics.
+    Classic EMA crossover:
 
-    Indicators:
-      - fast EMA
-      - slow EMA
+        - Bullish crossover: fast EMA crosses ABOVE slow EMA
+        - Bearish crossover: fast EMA crosses BELOW slow EMA
 
-    Entry:
-      - Bullish crossover: fast EMA crosses ABOVE slow EMA.
-
-    Exit:
-      - Bearish crossover: fast EMA crosses BELOW slow EMA.
-
-    Metadata includes:
-      - Unrealized P/L
-      - Drawdown status
-      - Last entry price
-      - Time since last trade
-      - Rolling EMAs
-      - Volatility-ready fields for future use
+    Uses a unified `on_bar` loop compatible with FastBacktestEngine.
     """
 
     def __init__(self, params: dict | None = None):
-        super().__init__(params)
+        super().__init__(params or {})
 
-        self.fast_window: int = int(self.params.get("fast_window", 9))
-        self.slow_window: int = int(self.params.get("slow_window", 21))
-        self.buffer_pct: float = float(self.params.get("buffer_pct", 0.0))
+        # EMA windows
+        self.fast_window = int(self.params.get("fast_window", 9))
+        self.slow_window = int(self.params.get("slow_window", 21))
 
         if self.fast_window >= self.slow_window:
-            logger.warning("Fast EMA >= Slow EMA — unusual configuration.")
+            logger.warning("Fast window >= slow window — unusual config.")
 
-        max_history: int = int(
+        # Optional breakout strength filter
+        self.buffer_pct = float(self.params.get("buffer_pct", 0.0))
+
+        # Optional risk controls
+        self.stop_loss_pct = float(self.params.get("stop_loss_pct", 0.0))
+        self.take_profit_pct = float(self.params.get("take_profit_pct", 0.0))
+
+        # Rolling close buffer
+        max_history = int(
             self.params.get("max_history", max(
                 self.fast_window, self.slow_window) * 4)
         )
+        self.closes: Deque[float] = deque(maxlen=max_history)
 
-        # Rolling price buffer
-        self.closes = deque(maxlen=max_history)
-
-        # EMA states
+        # EMA state
         self.fast_ema: Optional[float] = None
         self.slow_ema: Optional[float] = None
         self.prev_fast_ema: Optional[float] = None
         self.prev_slow_ema: Optional[float] = None
 
-    # ------------------------------------------------------------------
-    # Indicator Updates
-    # ------------------------------------------------------------------
+        # Position state
+        self.in_position = False
+        self.entry_price: Optional[float] = None
 
-    def _update_indicators(self, candle) -> None:
-        price = float(candle.close)
+    def reset(self):
+        self.closes.clear()
+        self.fast_ema = None
+        self.slow_ema = None
+        self.prev_fast_ema = None
+        self.prev_slow_ema = None
+        self.in_position = False
+        self.entry_price = None
+
+    # ---------------------------------------------------------
+    # EMA update helpers
+    # ---------------------------------------------------------
+    def _update_indicators(self, price: float):
         self.closes.append(price)
 
-        # Shift previous values
+        # Save previous EMA values for crossover detection
         self.prev_fast_ema = self.fast_ema
         self.prev_slow_ema = self.slow_ema
 
         # Streaming EMA updates
-        self.fast_ema = ema(self.closes, self.fast_window,
-                            prev_ema=self.fast_ema)
-        self.slow_ema = ema(self.closes, self.slow_window,
-                            prev_ema=self.slow_ema)
+        self.fast_ema = ema(self.fast_ema, price, self.fast_window)
+        self.slow_ema = ema(self.slow_ema, price, self.slow_window)
 
     def _has_enough_data(self) -> bool:
         return (
@@ -91,106 +94,112 @@ class MovingAverageCrossoverStrategy(Strategy):
             and self.prev_slow_ema is not None
         )
 
-    # ------------------------------------------------------------------
-    # Crossover Logic
-    # ------------------------------------------------------------------
-
+    # ---------------------------------------------------------
+    # Crossover logic
+    # ---------------------------------------------------------
     def _bullish_crossover(self) -> bool:
         if not self._has_enough_data():
             return False
 
-        was_below_or_equal = self.prev_fast_ema <= self.prev_slow_ema
-        threshold = 1.0 + self.buffer_pct
-        is_above_now = self.fast_ema > self.slow_ema * threshold
+        was_below = self.prev_fast_ema <= self.prev_slow_ema
+        is_above = self.fast_ema > self.slow_ema * (1 + self.buffer_pct)
 
-        return was_below_or_equal and is_above_now
+        return was_below and is_above
 
     def _bearish_crossover(self) -> bool:
         if not self._has_enough_data():
             return False
 
-        was_above_or_equal = self.prev_fast_ema >= self.prev_slow_ema
-        threshold = 1.0 - self.buffer_pct
-        is_below_now = self.fast_ema < self.slow_ema * threshold
+        was_above = self.prev_fast_ema >= self.prev_slow_ema
+        is_below = self.fast_ema < self.slow_ema * (1 - self.buffer_pct)
 
-        return was_above_or_equal and is_below_now
+        return was_above and is_below
 
-    # ------------------------------------------------------------------
-    # Strategy Decisions
-    # ------------------------------------------------------------------
-
-    def should_enter(self, candle, portfolio_state) -> bool:
-        self._update_indicators(candle)
-
-        if self._bullish_crossover():
-            logger.info("[MA_XOVER] ENTER signal detected")
-            return True
-
-        return False
-
-    def should_exit(self, candle, portfolio_state) -> bool:
-        # ensure indicators updated even if runner calls exit first
-        if self.fast_ema is None:
-            self._update_indicators(candle)
-
-        if self._bearish_crossover():
-            logger.info("[MA_XOVER] EXIT signal detected")
-            return True
-
-        return False
-
-    # ------------------------------------------------------------------
-    # Enriched Metadata
-    # ------------------------------------------------------------------
-
-    def generate_signal(self, candle, portfolio_state) -> StrategySignal:
-        sig = super().generate_signal(candle, portfolio_state)
-
-        if sig.metadata is None:
-            sig.metadata = {}
-
+    # ---------------------------------------------------------
+    # MAIN on_bar LOOP
+    # ---------------------------------------------------------
+    def on_bar(self, candle):
         price = float(candle.close)
+        ts = candle.timestamp
 
-        # ---- Portfolio Metrics ----
-        unrealized = compute_unrealized_pnl(portfolio_state, price)
-        last_entry, opened_at, seconds_since = compute_last_trade_info(
-            portfolio_state)
-        dd = compute_drawdown_status(
-            portfolio_state, unrealized_pnl=unrealized)
+        # Update EMAs
+        self._update_indicators(price)
 
-        sig.metadata.update(
-            {
-                # Strategy Info
-                "strategy": "moving_average_crossover",
-                "fast_window": self.fast_window,
-                "slow_window": self.slow_window,
-                "buffer_pct": self.buffer_pct,
-                # Indicator Context
-                "fast_ema": self.fast_ema,
-                "slow_ema": self.slow_ema,
-                "prev_fast_ema": self.prev_fast_ema,
-                "prev_slow_ema": self.prev_slow_ema,
-                "price": price,
-                # Trade Context
-                "unrealized_pnl": unrealized,
-                "last_entry_price": last_entry,
-                "last_trade_opened_at": opened_at.isoformat() if opened_at else None,
-                "time_since_last_trade_seconds": seconds_since,
-                # Drawdown Context
-                "current_equity_est": dd["current_equity"],
-                "estimated_peak_equity": dd["estimated_peak_equity"],
-                "drawdown_abs": dd["drawdown_abs"],
-                "drawdown_pct": dd["drawdown_pct"],
-                "max_intraday_drawdown": dd["max_intraday_drawdown"],
-            }
+        if not self._has_enough_data():
+            return None
+
+        metadata = {
+            "price": price,
+            "fast_ema": self.fast_ema,
+            "slow_ema": self.slow_ema,
+            "prev_fast_ema": self.prev_fast_ema,
+            "prev_slow_ema": self.prev_slow_ema,
+            "in_position": self.in_position,
+        }
+
+        # =====================================================
+        # OPTIONAL: Stop-loss / take-profit
+        # =====================================================
+        if self.in_position and self.entry_price is not None:
+            if self.stop_loss_pct > 0:
+                sl = self.entry_price * (1 - self.stop_loss_pct / 100)
+                if price <= sl:
+                    self.in_position = False
+                    return StrategySignal(
+                        signal_type="EXIT",
+                        price=price,
+                        timestamp=ts,
+                        metadata=metadata | {"reason": "stop_loss"},
+                    )
+
+            if self.take_profit_pct > 0:
+                tp = self.entry_price * (1 + self.take_profit_pct / 100)
+                if price >= tp:
+                    self.in_position = False
+                    return StrategySignal(
+                        signal_type="EXIT",
+                        price=price,
+                        timestamp=ts,
+                        metadata=metadata | {"reason": "take_profit"},
+                    )
+
+        # =====================================================
+        # ENTRY — Bullish crossover
+        # =====================================================
+        if not self.in_position and self._bullish_crossover():
+            self.in_position = True
+            self.entry_price = price
+
+            logger.info("[MA_XOVER] ENTER: Fast EMA crossed above slow EMA")
+
+            return StrategySignal(
+                signal_type="ENTER",
+                price=price,
+                timestamp=ts,
+                metadata=metadata | {"reason": "bullish_crossover"},
+            )
+
+        # =====================================================
+        # EXIT — Bearish crossover
+        # =====================================================
+        if self.in_position and self._bearish_crossover():
+            self.in_position = False
+
+            logger.info("[MA_XOVER] EXIT: Fast EMA crossed below slow EMA")
+
+            return StrategySignal(
+                signal_type="EXIT",
+                price=price,
+                timestamp=ts,
+                metadata=metadata | {"reason": "bearish_crossover"},
+            )
+
+        # =====================================================
+        # HOLD
+        # =====================================================
+        return StrategySignal(
+            signal_type="HOLD",
+            price=price,
+            timestamp=ts,
+            metadata=metadata,
         )
-
-        # Refine reason
-        if sig.signal_type == SignalType.ENTER:
-            sig.metadata["reason"] = "bullish_ma_crossover"
-        elif sig.signal_type == SignalType.EXIT:
-            sig.metadata["reason"] = "bearish_ma_crossover"
-        else:
-            sig.metadata.setdefault("reason", "ma_hold")
-
-        return sig
